@@ -112,15 +112,15 @@ def _find_floor(frame, peak, threshold):
     """
     offset_l, offset_r = 2, 2
     incr_l, incr_r = 1, 1
-    r_max = frame.shape[0] - peak - 1
+    r_max = frame.shape[0] - 1
 
     while incr_l and incr_r:
         l_edge, r_edge = peak - offset_l, peak + offset_r
 
-        if l_edge == 0 or frame[l_edge] < threshold:
-            incr_l = 0
-        if r_edge == r_max or frame[r_edge] < threshold:
-            incr_r = 0
+        if l_edge <= 0 or frame[l_edge] < threshold:
+            l_edge, incr_l = 0, 0
+        if r_edge >= r_max or frame[r_edge] < threshold:
+            r_edge, incr_r = r_max, 0
 
         offset_l += incr_l
         offset_r += incr_r
