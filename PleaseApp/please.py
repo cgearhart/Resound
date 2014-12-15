@@ -7,7 +7,7 @@ SEARCH_LIMIT = 12
 
 
 def fingerprints(t_signal, freq=None, frame_width=4096, overlap=2048,
-                 density=15, fanout=.025, floor=0.2):
+                 density=7, fanout=.1, maxpairs=5, floor=0.2):
     """
     Generator function for successive fingerprint hashes from a mono-channel
     time-domain audio signal. as a set of tuples (f1, f2, t2-t1), where f1 and
@@ -30,6 +30,8 @@ def fingerprints(t_signal, freq=None, frame_width=4096, overlap=2048,
     offset = freq // overlap
     w_height = fanout * frame_width // 2
     for f1, t1 in peaks:
+        paircount = 0
+
         if t1 > t_signal.shape[0] - offset:
             break
 
@@ -39,7 +41,10 @@ def fingerprints(t_signal, freq=None, frame_width=4096, overlap=2048,
 
         for f2, t2 in peaks:
             if t_min < t2 < t_max and f_min < f2 < f_max:
+                paircount += 1
                 yield _fingerprint_hash(f1, f2, t2 - t1)
+            if paircount >= maxpairs:
+                break
 
 
 def spectrogram(t_signal, frame_width, overlap):
