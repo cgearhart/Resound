@@ -64,11 +64,11 @@ def spectrogram(t_signal, frame_width, overlap):
 
 def _fingerprint_hash(f1, f2, dt):
     """
-    Calculate a 32-bit int hash of the fingerprint: <f1:f2:dt> f1 and f2 are
-    in the range [0, 4096), and dt in the range [0, 1024)
+    Calculate a 64-bit int hash of the fingerprint: <f1:f2:dt> f1 and f2 are
+    in the range [0, 65536), and dt in the range [0, 1024)
     """
-    key = (f1 & 0xfff) << 24 | (f2 & 0xfff) << 12 | (dt & 0x3ff)
-    return key.astype(np.uint32).item()
+    key = (f1 & 0xffff) << 48 | (f2 & 0xffff) << 32 | (dt & 0x3ff)
+    return key.astype(np.uint64).item()
 
 
 def _extract_peaks(specgram, num_peaks, floor):
