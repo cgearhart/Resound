@@ -1,105 +1,123 @@
 
 import numpy as np
-from numpy.fft import fft
+from numpy.fft import rfft
+
+# number of rounds to allow in the threshold filter search before aborting
+SEARCH_LIMIT = 12
 
 
-def spectrogram(t_signal, freq, window_size, time_shift):
+def fingerprints(t_signal, freq=None, frame_width=4096, overlap=2048,
+                 density=15, fanout=.025, floor=0.2):
     """
-    Calculate the STFT of a time-domain signal. The frame window size and
-    time shift are specified in seconds, and the frequency in hertz.
+    Generator function for successive fingerprint hashes from a mono-channel
+    time-domain audio signal. as a set of tuples (f1, f2, t2-t1), where f1 and
+    f2 are peak frequencies and t2-t1 is the time offset between the peaks.
+    The density constant defines the target number of peaks per second.
     """
-    fs = int(freq * window_size)
-    offset = int(freq * time_shift)
-    w = np.hamming(fs)
+    # Enforce default parameter constraints for STFT
+    freq = freq or 44100
+    frame_width = min(t_signal.shape[0], frame_width)
 
-    num_frames = (len(t_signal) - fs) // offset
-    num_components = (fs + 1) // 2
-    f_signal = np.empty([num_frames, num_components], dtype='float64')
+    specgram = spectrogram(t_signal, frame_width=frame_width, overlap=overlap)
 
-    for i, t in enumerate(range(0, len(t_signal) - fs), offset):
-        # only keep the first half of the components
-        f_signal[i, :] = fft(w * t_signal[t:t + fs])[:num_components]
+    pps = 1.0 * density * len(t_signal) / freq
+    peaks = _extract_peaks(specgram, num_peaks=pps, floor=floor)
 
-    return abs(f_signal)
+    if not peaks:
+        raise StopIteration
+
+    # generate feature constellations from peak anchors
+    offset = freq // overlap
+    w_height = fanout * frame_width // 2
+    for f1, t1 in peaks:
+        if t1 > t_signal.shape[0] - offset:
+            break
+
+        # limit constellations to a window
+        t_min, t_max = t1 + offset, t1 + 2 * offset
+        f_min, f_max = f1 - w_height, f1 + w_height
+
+        for f2, t2 in peaks:
+            if t_min < t2 < t_max and f_min < f2 < f_max:
+                yield _fingerprint_hash(f1, f2, t2 - t1)
 
 
-class Please(object):
+def spectrogram(t_signal, frame_width, overlap):
     """
-    This class provides a simple implementation of the Shazam algorithm for
-    audio file identification.
+    Calculate the magnitude spectrogram of a single-channel time-domain signal
+    from the real frequency components of the STFT with a hanning window
+    applied to each frame. The frame size and overlap between frames should
+    be specified in number of samples.
     """
+    w = np.hanning(frame_width)
+    num_components = frame_width // 2 + 1
+    num_frames = 1 + (len(t_signal) - frame_width) // overlap
 
-    _ROUND_LIMIT = 10  # number of search rounds for signal threshold
+    f_signal = np.empty([num_frames, num_components], dtype=np.complex_)
+    for i, t in enumerate(range(0, len(t_signal) - frame_width, overlap)):
+        # using rfft avoids computing negative frequency components
+        f_signal[i] = rfft(w * t_signal[t:t + frame_width])
 
-    # dimension constraints for the target zone window
-    _HEIGHT = 0.10  # half-height (percentage)
-    _DEPTH = 3  # window depth (number of seconds)
-    _DELAY = 1  # delay from anchor time to start of target zone window
+    # amplitude in decibels
+    return 20 * np.log10(np.abs(f_signal))
 
-    def __init__(self, freq=44100, frame_time=.05, density=3, tolerance=0.2):
-        """
-        Set the expected sampling frequency of the audio signal and define the
-        window function time frame, and offset between window frames. The
-        density argument is the desired number of peaks per second.
-        """
-        self.freq = freq
-        self.frame_width = frame_time
-        self.offset = 0.5 * frame_time
-        self.density = density * frame_time  # expected peaks per frame
-        self.tolerance = tolerance * self.density
 
-    def fingerprints(self, t_signal):
-        """
-        Create a list of fingerprint hashes from a time-domain audio signal as
-        a set of tuples (f1, f2, t2-t1), where f1 and f2 are peak frequencies
-        and t2-t1 is the time offset between the peaks. Each f1 is an "anchor"
-        point, and each f2 is within the target window as defined by
-        experimentally determined constants.
-        """
+def _fingerprint_hash(f1, f2, dt):
+    """
+    Calculate a 32-bit int hash of the fingerprint: <f1:f2:dt> f1 and f2 are
+    in the range [0, 4096), and dt in the range [0, 1024)
+    """
+    key = (f1 & 0xfff) << 24 | (f2 & 0xfff) << 12 | (dt & 0x3ff)
+    return key.astype(np.uint32).item()
 
-        f_signal = spectrogram(t_signal, self.freq,
-                               self.frame_width, self.offset)
 
-        f_signal /= f_signal.max()  # scale the data to range [0, 1.0]
-        peaks = self._find_peaks(f_signal)  # extract peaks at target density
+def _extract_peaks(specgram, num_peaks, floor):
+    """
+    Generator function for extracting peaks from a spectrogram (in dB) by
+    parabolic interpolation.
 
-        # calculate the constellation target zone dimensions
-        h_max, t_max = peaks.shape
-        dy = self._HEIGHT * h_max
-        dx = self._DEPTH * self.frame_width
-        delta = self._DELAY * self.frame_width
+    https://ccrma.stanford.edu/~jos/parshl/Peak_Detection_Steps_3.html
+    """
+    peaks = []
+    # quit if the specgram is empty
+    if np.allclose(specgram, 0) or np.isinf(specgram.max()):
+        return peaks
 
-        for f1, t1 in np.transpose(np.nonzero(peaks)):
-            # filter anchor points based on target zone dimensions
-            if f1 < dy or f1 > h_max - dy or t1 > t_max - dx - delta:
-                continue
+    specgram /= specgram.max()
 
-            x = t1 + delta
-            for f2, t2 in np.transpose(np.nonzero(peaks[x:x+dx, f1-dy:f1+dy])):
-                yield (f1, f2, t2 - t1)
-            
-    def _find_peaks(self, f_signal):
-        """
-        Use a binary search to automatically determine an appropriate threshold
-        value to find peaks in the spectrogram
-        """
-        threshold, delta = 0.5, 0.5
-        for _ in range(self._ROUND_LIMIT):
+    while len(peaks) < num_peaks and specgram.max() > floor:
 
-            tData = f_signal > threshold
+        # find the max element in the spectrogram
+        f, kb = np.unravel_index(specgram.argmax(), specgram.shape)
+        peaks.append((f, kb))
 
-            # Calculate the average number of peaks per frame
-            peaks_per_frame = np.mean(np.sum(tData, axis=0))
+        # remove the peak from the spectrogram
+        start, end = _find_floor(specgram[f], kb, floor)
+        first, last = max(0, f - 1), min(specgram.shape[0], f + 2)
+        specgram[first:last, start:end] = 0
 
-            # return if the average peak count is within tolerance otherwise
-            # loop to refine the threshold
-            if abs(peaks_per_frame - self.density) <= self.tolerance:
-                return f_signal * tData
-            elif peaks_per_frame > self.density:
-                threshold -= delta
-            elif peaks_per_frame < self.density:
-                threshold += delta
-            delta /= 2
+    return peaks
 
-        # Raise an error because the search did not converge
-        raise Exception("Threshold convergence failed in _find_peaks.")
+
+def _find_floor(frame, peak, threshold):
+    """
+    Estimate the width of frequency peaks in a STFT signal frame by performing
+    a linear scan through the frame from a peak center to the left and right
+    edge points where the signal falls below a threshold.
+    """
+    offset_l, offset_r = 2, 2
+    incr_l, incr_r = 1, 1
+    r_max = frame.shape[0] - peak - 1
+
+    while incr_l and incr_r:
+        l_edge, r_edge = peak - offset_l, peak + offset_r
+
+        if l_edge == 0 or frame[l_edge] < threshold:
+            incr_l = 0
+        if r_edge == r_max or frame[r_edge] < threshold:
+            incr_r = 0
+
+        offset_l += incr_l
+        offset_r += incr_r
+
+    return (l_edge, r_edge)
