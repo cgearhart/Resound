@@ -91,8 +91,9 @@ def _get_hash(f1, f2, dt):
     time difference between f1 and f2 as the the difference in frame number
     between the points.
     """
-    key = (f1 & 0xffff) << 48 | (f2 & 0xffff) << 32 | (dt & 0x3fff)
-    return key.astype(np.uint64).item()
+    return ((long(f1) & 0xffff) << 48 |
+            (long(f2) & 0xffff) << 32 |
+            (long(dt) & 0x3fff))
 
 
 def _extract_peaks(specgram, strides, threshold=THRESHOLD):
