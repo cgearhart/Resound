@@ -2,58 +2,75 @@
 import numpy as np
 from numpy.fft import rfft
 
-# number of rounds to allow in the threshold filter search before aborting
-SEARCH_LIMIT = 12
+# Spectrogram parameter defaults
+FREQ = 44100
+FRAME_WIDTH = 4096
+FRAME_OVERLAP = 2048
+
+# Define the number of partitions for subcells in peak finding, and the
+# threshold value for the minimum peak/avg ratio required to accept a peak
+FREQ_BINS = 16
+TIME_BINS = 3  # number of time bins per second
+
+# Threshold function biases towards low frequency peaks (there is almost no
+# signal at high frequency; samples are very close to the noise floor, and
+# it's easier to ignore those points than to deal with finding the noise
+# floor)
+THRESHOLD = lambda x, y: 0.9 * (1 - (1.0 * x / y) ** 4)
+
+# Define the number of column bins to skip (the gap from a peak to the
+# constellation window) and the size of the constellation window
+WINDOW_GAP = 1  # time in seconds
+WINDOW_F_BINS = 3
+WINDOW_TIME = 2  # time in seconds
 
 
-def fingerprints(t_signal, freq=None, frame_width=4096, overlap=2048,
-                 density=7, fanout=.1, maxpairs=5, floor=0.2):
+def hashes(t_signal, freq=FREQ):
     """
-    Generator function for successive fingerprint hashes from a mono-channel
-    time-domain audio signal. as a set of tuples (f1, f2, t2-t1), where f1 and
-    f2 are peak frequencies and t2-t1 is the time offset between the peaks.
-    The density constant defines the target number of peaks per second.
+    Generator function for successive hashes calculated from a mono-channel
+    time-domain audio signal as a set of tuples, (<long>, <int>). The <long>
+    should be an integral 64-bit hash so it can be used as a database ID, and
+    the <int> should be the frame number associated with the beginning of
+    the time bin for the anchor point.
     """
-    # Enforce default parameter constraints for STFT
-    freq = freq or 44100
-    frame_width = min(t_signal.shape[0], frame_width)
+    specgram = spectrogram(t_signal)
 
-    specgram = spectrogram(t_signal, frame_width=frame_width, overlap=overlap)
+    frames_per_tbin = (FRAME_OVERLAP * TIME_BINS)
 
-    pps = 1.0 * density * len(t_signal) / freq
-    peaks = _extract_peaks(specgram, num_peaks=pps, floor=floor)
+    t_step = freq // frames_per_tbin  # TIME_BINS splits in 1 sec
+    f_step = FRAME_WIDTH // FREQ_BINS // 2  # FREQ_BINS splits on freq axis
+    peaks = _extract_peaks(specgram, strides=(t_step, f_step))
 
-    if not peaks:
-        raise StopIteration
+    for i, (t1, f1) in enumerate(peaks):
 
-    # generate feature constellations from peak anchors
-    offset = freq // overlap
-    w_height = fanout * frame_width // 2
-    for f1, t1 in peaks:
-        paircount = 0
-
-        if t1 > t_signal.shape[0] - offset:
+        if t1 > t_signal.shape[0] - (WINDOW_GAP + WINDOW_TIME) * freq:
             break
 
         # limit constellations to a window
-        t_min, t_max = t1 + offset, t1 + 2 * offset
-        f_min, f_max = f1 - w_height, f1 + w_height
+        t_min = int(t1 + WINDOW_GAP * freq / FRAME_WIDTH / 2)
+        t_max = int(t_min + WINDOW_TIME * freq / FRAME_WIDTH / 2)
+        f_min = max(0, f1 - WINDOW_F_BINS * f_step // 4)
+        f_max = min(specgram.shape[1], f1 + WINDOW_F_BINS * f_step // 4)
 
-        for f2, t2 in peaks:
-            if t_min < t2 < t_max and f_min < f2 < f_max:
-                paircount += 1
-                yield _fingerprint_hash(f1, f2, t2 - t1)
-            if paircount >= maxpairs:
+        # print t1, f1, t_min, t_max, f_min, f_max
+
+        for t2, f2 in peaks[i:]:
+            if t2 < t_min or f2 < f_min:
+                continue
+            elif t2 > t_max:
                 break
+            elif f2 < f_max:
+                yield (_get_hash(f1, f2, t2 - t1), t1 // frames_per_tbin)
 
 
-def spectrogram(t_signal, frame_width, overlap):
+def spectrogram(t_signal, frame_width=FRAME_WIDTH, overlap=FRAME_OVERLAP):
     """
     Calculate the magnitude spectrogram of a single-channel time-domain signal
     from the real frequency components of the STFT with a hanning window
     applied to each frame. The frame size and overlap between frames should
     be specified in number of samples.
     """
+    frame_width = min(t_signal.shape[0], frame_width)
     w = np.hanning(frame_width)
     num_components = frame_width // 2 + 1
     num_frames = 1 + (len(t_signal) - frame_width) // overlap
@@ -64,65 +81,41 @@ def spectrogram(t_signal, frame_width, overlap):
         f_signal[i] = rfft(w * t_signal[t:t + frame_width])
 
     # amplitude in decibels
-    return 20 * np.log10(np.abs(f_signal))
+    return 20 * np.log10(np.absolute(f_signal))
 
 
-def _fingerprint_hash(f1, f2, dt):
+def _get_hash(f1, f2, dt):
     """
-    Calculate a 64-bit int hash of the fingerprint: <f1:f2:dt> f1 and f2 are
-    in the range [0, 65536), and dt in the range [0, 1024)
+    Calculate a 64-bit integral hash from <f1:f2:dt>, where f1 and f2 are
+    FFT frequency bins (based on frame width), and dt is propotional to the
+    time difference between f1 and f2 as the the difference in frame number
+    between the points.
     """
-    key = (f1 & 0xffff) << 48 | (f2 & 0xffff) << 32 | (dt & 0x3ff)
+    key = (f1 & 0xffff) << 48 | (f2 & 0xffff) << 32 | (dt & 0x3fff)
     return key.astype(np.uint64).item()
 
 
-def _extract_peaks(specgram, num_peaks, floor):
+def _extract_peaks(specgram, strides, threshold=THRESHOLD):
     """
-    Generator function for extracting peaks from a spectrogram (in dB) by
-    parabolic interpolation.
-
-    https://ccrma.stanford.edu/~jos/parshl/Peak_Detection_Steps_3.html
+    Partition the spectrogram into subcells and extract peaks from each
+    cell if the peak is sufficiently energetic compared to the neighborhood.
     """
+    sr, sc = strides
     peaks = []
-    # quit if the specgram is empty
-    if np.allclose(specgram, 0) or np.isinf(specgram.max()):
-        return peaks
+    for i in range(0, specgram.shape[0], sr):
+        for j in range(0, specgram.shape[1], sc):
+            cell = specgram[i:i + sr, j:j + sc]
+            cmax = cell.max()
+            cavg = np.mean(cell)
 
-    specgram /= specgram.max()
+            if not (np.isfinite(cmax) and np.isfinite(cavg)):
+                continue
 
-    while len(peaks) < num_peaks and specgram.max() > floor:
+            if cmax * threshold(j, specgram.shape[1]) > cavg:
+                x, y = np.unravel_index(cell.argmax(), cell.shape)
 
-        # find the max element in the spectrogram
-        f, kb = np.unravel_index(specgram.argmax(), specgram.shape)
-        peaks.append((f, kb))
-
-        # remove the peak from the spectrogram
-        start, end = _find_floor(specgram[f], kb, floor)
-        first, last = max(0, f - 1), min(specgram.shape[0], f + 2)
-        specgram[first:last, start:end] = 0
+                # ignore values on the border (at 0 or max frequency)
+                if 0 < j + y < specgram.shape[1]:
+                    peaks.append((i + x, j + y))
 
     return peaks
-
-
-def _find_floor(frame, peak, threshold):
-    """
-    Estimate the width of frequency peaks in a STFT signal frame by performing
-    a linear scan through the frame from a peak center to the left and right
-    edge points where the signal falls below a threshold.
-    """
-    offset_l, offset_r = 2, 2
-    incr_l, incr_r = 1, 1
-    r_max = frame.shape[0] - 1
-
-    while incr_l and incr_r:
-        l_edge, r_edge = peak - offset_l, peak + offset_r
-
-        if l_edge <= 0 or frame[l_edge] < threshold:
-            l_edge, incr_l = 0, 0
-        if r_edge >= r_max or frame[r_edge] < threshold:
-            r_edge, incr_r = r_max, 0
-
-        offset_l += incr_l
-        offset_r += incr_r
-
-    return (l_edge, r_edge)
