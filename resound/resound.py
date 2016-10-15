@@ -2,6 +2,9 @@
 import numpy as np
 from numpy.fft import rfft
 
+from scipy.ndimage.filters import convolve
+from scipy.ndimage.morphology import grey_dilation
+
 # Spectrogram parameter defaults
 FREQ = 44100
 FRAME_WIDTH = 4096
@@ -12,12 +15,6 @@ FRAME_OVERLAP = 2048
 FREQ_BINS = 16
 TIME_BINS = 3  # number of time bins per second
 
-# Threshold function biases towards low frequency peaks (there is almost no
-# signal at high frequency; samples are very close to the noise floor, and
-# it's easier to ignore those points than to deal with finding the noise
-# floor)
-THRESHOLD = lambda x, y: 0.9 * (1 - (1.0 * x / y) ** 4)
-
 # Define the number of column bins to skip (the gap from a peak to the
 # constellation window) and the size of the constellation window
 WINDOW_GAP = 1  # time in seconds
@@ -25,7 +22,7 @@ WINDOW_F_BINS = 3
 WINDOW_TIME = 2  # time in seconds
 
 
-def hashes(t_signal, freq=FREQ):
+def hashes(t_signal, freq=FREQ, threshold=0.4):
     """
     Generator function for successive hashes calculated from a mono-channel
     time-domain audio signal as a set of tuples, (<long>, <int>). The <long>
@@ -39,7 +36,7 @@ def hashes(t_signal, freq=FREQ):
 
     t_step = freq // frames_per_tbin  # TIME_BINS splits in 1 sec
     f_step = FRAME_WIDTH // FREQ_BINS // 2  # FREQ_BINS splits on freq axis
-    peaks = _extract_peaks(specgram, strides=(t_step, f_step))
+    peaks = _extract_peaks(specgram, neighborhood=(t_step, f_step), threshold=threshold)
 
     for i, (t1, f1) in enumerate(peaks):
 
@@ -53,14 +50,13 @@ def hashes(t_signal, freq=FREQ):
         f_max = min(specgram.shape[1], f1 + WINDOW_F_BINS * f_step // 4)
 
         # print t1, f1, t_min, t_max, f_min, f_max
-
         for t2, f2 in peaks[i:]:
             if t2 < t_min or f2 < f_min:
                 continue
             elif t2 > t_max:
                 break
             elif f2 < f_max:
-                yield (_get_hash(f1, f2, t2 - t1), t1 // frames_per_tbin)
+                yield (_get_hash(f1, f2, t2 - t1), t1)
 
 
 def spectrogram(t_signal, frame_width=FRAME_WIDTH, overlap=FRAME_OVERLAP):
@@ -96,27 +92,21 @@ def _get_hash(f1, f2, dt):
             (long(dt) & 0x3fff))
 
 
-def _extract_peaks(specgram, strides, threshold=THRESHOLD):
+def _extract_peaks(specgram, neighborhood, threshold):
     """
     Partition the spectrogram into subcells and extract peaks from each
     cell if the peak is sufficiently energetic compared to the neighborhood.
     """
-    sr, sc = strides
-    peaks = []
-    for i in range(0, specgram.shape[0], sr):
-        for j in range(0, specgram.shape[1], sc):
-            cell = specgram[i:i + sr, j:j + sc]
-            cmax = cell.max()
-            cavg = np.mean(cell)
+    kernel = np.ones(shape=neighborhood)
+    local_averages = convolve(specgram, kernel / kernel.sum(), mode="constant", cval=0)
 
-            if not (np.isfinite(cmax) and np.isfinite(cavg)):
-                continue
+    # suppress all points below the floor value
+    floor = (1 + threshold) * local_averages
+    candidates = np.where(specgram > floor, specgram, 0)
 
-            if cmax * threshold(j, specgram.shape[1]) > cavg:
-                x, y = np.unravel_index(cell.argmax(), cell.shape)
-
-                # ignore values on the border (at 0 or max frequency)
-                if 0 < j + y < specgram.shape[1]:
-                    peaks.append((i + x, j + y))
+    # grayscale dilation is equivalent to non-maximal suppression
+    local_maximums = grey_dilation(candidates, footprint=kernel)
+    peak_coords = np.argwhere(specgram == local_maximums)
+    peaks = zip(peak_coords[:, 0], peak_coords[:, 1])
 
     return peaks

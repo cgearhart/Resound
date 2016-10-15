@@ -8,8 +8,12 @@ if os.path.exists('README.txt'):
 # https://pythonhosted.org/setuptools/setuptools.html#id7
 setup(
     name='Resound',
-    version='1.0',
+    version='1.1',
     packages=['resound'],
+    install_requires=[
+        'scipy',
+        'numpy'
+    ],
     author="Chris Gearhart",
     author_email="chris@gearley.com",
     description="Audio clip fingerprinting library",
