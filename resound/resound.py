@@ -6,50 +6,75 @@ from scipy.ndimage.filters import convolve
 from scipy.ndimage.morphology import grey_dilation
 
 # Spectrogram parameter defaults
+# FREQ is the number of samples/sec in the audio file
+# FRAME_WIDTH is the number of samples to include in each window frame of
+# the DTFT. FRAME_OVERLAP is the step size (in samples/sec) to advance
+# the window
 FREQ = 44100
 FRAME_WIDTH = 4096
-FRAME_OVERLAP = 2048
+FRAME_STRIDE = 1024
 
 # Define the number of partitions for subcells in peak finding, and the
 # threshold value for the minimum peak/avg ratio required to accept a peak
-FREQ_BINS = 16
-TIME_BINS = 3  # number of time bins per second
+# Ex. If there are 2048 frequency terms in the DTFT of each window and 16
+# frequency bins then the exclusion window for non-max suppression will
+# contain 64 frequency values; 2048 / 16 = 64. If there are 18 time frames
+# per second, then the exclusion window will be 18 / 4 = 4 bins (1/4 second)
+FREQ_STRIDE = 32
+TIME_STRIDE = 4
 
-# Define the number of column bins to skip (the gap from a peak to the
-# constellation window) and the size of the constellation window
-WINDOW_GAP = 1  # time in seconds
-WINDOW_F_BINS = 3
-WINDOW_TIME = 2  # time in seconds
+ROWS_PER_SECOND = (1 + (FREQ - FRAME_WIDTH) // FRAME_STRIDE)
+
+# T_STEP is the number of DTFT windows (rows in specgram) to include in the
+# exclusion window for non-max suppression
+# Ex. 1 + (44100 - 4096) / 1024 = 40.06  : there are 40 sample windows/sec
+#     40 // 3 = 13 rows
+T_STEP = ROWS_PER_SECOND // TIME_STRIDE
+
+# F_STEP is the number of DTFT frequencies (columns in specgram) to include
+# in the non-max suppression exclusion window.
+# Ex. (4096 // 2) / 16 = 128
+# The DTFT can only return frequencies up to 1/2 the frame width.
+F_STEP = (FRAME_WIDTH // 2) // FREQ_STRIDE
+
+F_WIDTH = F_STEP * 2
 
 
-def hashes(t_signal, freq=FREQ, threshold=0.4):
+def get_peaks(t_signal, window_size=(T_STEP, F_STEP), threshold=0.4):
+
+    specgram = spectrogram(t_signal)
+
+    # window size is used for non-maximal suppression
+    peaks = _extract_peaks(specgram, neighborhood=window_size, threshold=threshold)
+
+    return peaks
+
+
+def hashes(peaks, f_width=F_WIDTH, t_gap=ROWS_PER_SECOND, t_width=2*ROWS_PER_SECOND):
     """
     Generator function for successive hashes calculated from a mono-channel
     time-domain audio signal as a set of tuples, (<long>, <int>). The <long>
-    should be an integral 64-bit hash so it can be used as a database ID, and
-    the <int> should be the frame number associated with the beginning of
+    is an integral 64-bit hash so it can be used as a database ID, and
+    the <int> is the frame number associated with the beginning of
     the time bin for the anchor point.
+
+    The frequency window of each peak for constellation is +/- 1 octave
+
+    Time gap and width recommendations:
+
+    To calculate N seconds in rows (DTFT time windows):
+        rows = N * (1 + (FREQ - FRAME_WIDTH) // FRAME_STRIDE)
+
     """
-    specgram = spectrogram(t_signal)
-
-    frames_per_tbin = (FRAME_OVERLAP * TIME_BINS)
-
-    t_step = freq // frames_per_tbin  # TIME_BINS splits in 1 sec
-    f_step = FRAME_WIDTH // FREQ_BINS // 2  # FREQ_BINS splits on freq axis
-    peaks = _extract_peaks(specgram, neighborhood=(t_step, f_step), threshold=threshold)
-
     for i, (t1, f1) in enumerate(peaks):
 
-        if t1 > t_signal.shape[0] - (WINDOW_GAP + WINDOW_TIME) * freq:
-            break
+        # limit constellations to a window -- a box constrained by a min
+        # and max time limit, and a min and max frequency bound
+        t_min = t1 + t_gap
+        t_max = t_min + t_width
+        f_min = f1 - f_width // 2
+        f_max = f1 + f_width // 2
 
-        # limit constellations to a window
-        t_min = int(t1 + WINDOW_GAP * freq / FRAME_WIDTH / 2)
-        t_max = int(t_min + WINDOW_TIME * freq / FRAME_WIDTH / 2)
-        f_min = max(0, f1 - WINDOW_F_BINS * f_step // 4)
-        f_max = min(specgram.shape[1], f1 + WINDOW_F_BINS * f_step // 4)
-
-        # print t1, f1, t_min, t_max, f_min, f_max
         for t2, f2 in peaks[i:]:
             if t2 < t_min or f2 < f_min:
                 continue
@@ -59,7 +84,7 @@ def hashes(t_signal, freq=FREQ, threshold=0.4):
                 yield (_get_hash(f1, f2, t2 - t1), t1)
 
 
-def spectrogram(t_signal, frame_width=FRAME_WIDTH, overlap=FRAME_OVERLAP):
+def spectrogram(t_signal, frame_width=FRAME_WIDTH, overlap=FRAME_STRIDE):
     """
     Calculate the magnitude spectrogram of a single-channel time-domain signal
     from the real frequency components of the STFT with a hanning window
@@ -77,7 +102,7 @@ def spectrogram(t_signal, frame_width=FRAME_WIDTH, overlap=FRAME_OVERLAP):
         f_signal[i] = rfft(w * t_signal[t:t + frame_width])
 
     # amplitude in decibels
-    return 20 * np.log10(np.absolute(f_signal))
+    return 20 * np.log10(1 + np.absolute(f_signal))
 
 
 def _get_hash(f1, f2, dt):

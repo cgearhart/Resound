@@ -8,7 +8,7 @@ if os.path.exists('README.txt'):
 # https://pythonhosted.org/setuptools/setuptools.html#id7
 setup(
     name='Resound',
-    version='1.1',
+    version='1.2',
     packages=['resound'],
     install_requires=[
         'scipy',
